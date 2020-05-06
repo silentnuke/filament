@@ -254,7 +254,11 @@ void VulkanDriver::beginFrame(int64_t monotonic_clock_ns, uint32_t frameId,
     acquireWorkCommandBuffer(mContext);
     mDisposer.release(mContext.work.resources);
 
-    acquireSwapCommandBuffer(mContext);
+    if (!acquireSwapCommandBuffer(mContext)) {
+        refreshSwapChain();
+        bool success = acquireSwapCommandBuffer(mContext);
+        ASSERT_POSTCONDITION(success, "Unable to acquire image from swap chain.");
+    }
     mDisposer.release(mContext.currentCommands->resources);
 
     // vkCmdBindPipeline and vkCmdBindDescriptorSets establish bindings to a specific command
@@ -452,11 +456,11 @@ void VulkanDriver::createSyncR(Handle<HwSync> sh, int) {
     // TODO: implement sync objects
 }
 
-void VulkanDriver::createSwapChainR(Handle<HwSwapChain> sch, void* nativeWindow,
-        uint64_t flags) {
+void VulkanDriver::createSwapChainR(Handle<HwSwapChain> sch, void* nativeWindow, uint64_t flags) {
     auto* swapChain = construct_handle<VulkanSwapChain>(mHandleMap, sch);
     VulkanSurfaceContext& sc = swapChain->surfaceContext;
     sc.surface = (VkSurfaceKHR) mContextManager.createVkSurfaceKHR(nativeWindow, mContext.instance);
+    sc.nativeWindow = nativeWindow;
     mContextManager.getClientExtent(nativeWindow, &sc.clientSize.width, &sc.clientSize.height);
     getPresentationQueue(mContext, sc);
     createSwapChain(mContext, sc);
@@ -580,6 +584,11 @@ void VulkanDriver::destroySwapChain(Handle<HwSwapChain> sch) {
         vkDestroyImageView(mContext.device, surfaceContext.depth.view, VKALLOC);
         vkDestroyImage(mContext.device, surfaceContext.depth.image, VKALLOC);
         vkFreeMemory(mContext.device, surfaceContext.depth.memory, VKALLOC);
+
+        vkDestroySurfaceKHR(mContext.instance, surfaceContext.surface, VKALLOC);
+        if (mContext.currentSurface == &surfaceContext) {
+            mContext.currentSurface = nullptr;
+        }
 
         destruct_handle<VulkanSwapChain>(mHandleMap, sch);
     }
@@ -789,9 +798,9 @@ void VulkanDriver::beginRenderPass(Handle<HwRenderTarget> rth, const RenderPassP
     assert(mContext.currentCommands);
     assert(mContext.currentSurface);
     VulkanSurfaceContext& surface = *mContext.currentSurface;
-    const SwapContext& swapContext = surface.swapContexts[surface.currentSwapIndex];
     mCurrentRenderTarget = handle_cast<VulkanRenderTarget>(mHandleMap, rth);
     VulkanRenderTarget* rt = mCurrentRenderTarget;
+
     const VkExtent2D extent = rt->getExtent();
     assert(extent.width > 0 && extent.height > 0);
 
@@ -862,6 +871,8 @@ void VulkanDriver::beginRenderPass(Handle<HwRenderTarget> rth, const RenderPassP
         clearValue.depthStencil = {(float) params.clearDepth, 0};
     }
     renderPassInfo.pClearValues = &clearValues[0];
+
+    const SwapContext& swapContext = surface.swapContexts[surface.currentSwapIndex];
 
     vkCmdBeginRenderPass(swapContext.commands.cmdbuffer, &renderPassInfo,
             VK_SUBPASS_CONTENTS_INLINE);
@@ -967,8 +978,10 @@ void VulkanDriver::commit(Handle<HwSwapChain> sch) {
         .pImageIndices = &surface.currentSwapIndex,
     };
     result = vkQueuePresentKHR(surface.presentQueue, &presentInfo);
-    ASSERT_POSTCONDITION(result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_SUBOPTIMAL_KHR,
-            "Stale / resized swap chain not yet supported.");
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        refreshSwapChain();
+        return;
+    }
     ASSERT_POSTCONDITION(result == VK_SUCCESS, "vkQueuePresentKHR error.");
 }
 
@@ -1279,6 +1292,24 @@ void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
     const uint32_t index = vtq->stoppingQueryIndex;
     const VkPipelineStageFlagBits stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     vkCmdWriteTimestamp(commands->cmdbuffer, stage, mContext.timestamps.pool, index);
+}
+
+void VulkanDriver::refreshSwapChain() {
+    VulkanSurfaceContext& surface = *mContext.currentSurface;
+    printf("%d => ", surface.surfaceCapabilities.currentExtent.width);
+    getSurfaceCaps(mContext, surface);
+    printf("%d\n", surface.surfaceCapabilities.currentExtent.width);
+
+    backend::destroySwapChain(mContext, surface, mDisposer);
+    createSwapChain(mContext, surface);
+
+    void* nativeWindow = surface.nativeWindow;
+    VkExtent2D size;
+    mContextManager.getClientExtent(nativeWindow, &size.width, &size.height);
+    printf("%d ==> %d\n", surface.clientSize.width, size.width);
+    surface.clientSize = size;
+
+    mFramebufferCache.reset();
 }
 
 #ifndef NDEBUG
